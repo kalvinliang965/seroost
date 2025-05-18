@@ -7,6 +7,8 @@ use std::env;
 use std::result::Result;
 use std::process::ExitCode;
 
+use tiny_http::{Server, Request, Response, Header};
+
 struct Lexer<'a> {
     content: &'a [char],
 }
@@ -171,9 +173,24 @@ fn usage(program: &str) {
     eprintln!("Usage: {program} [SUBCOMMAND] [OPTIONS]");
     eprintln!("Subcommands:");
     eprintln!("     index <folder>          index the <folder> and save the index to index.json file");
-    eprintln!("     search <index-file>     check how many documents are indexed in the file (searching is not implemented yet)")
+    eprintln!("     search <index-file>     check how many documents are indexed in the file (searching is not implemented yet)");
+    eprintln!("     serve [address]          start local HTTP server with web interface");
 }
 
+fn server_request(request: Request) -> Result<(), ()> {
+    println!("INFO: recieved request! method: {:?}, url: {:?}", request.method(), request.url());
+    let content_type_text_html = Header::from_bytes("Content-Type", "text/html; charset=utf-8")
+                                    .expect("That we didn't put any garbage in the header");
+    let index_html_path = "index.html";
+    let index_html_file = File::open(index_html_path).map_err(|err| {
+        eprintln!("ERROR: could not serve file {index_html_path}: {err}");
+    })?;
+    let response = Response::from_file(index_html_file).with_header(content_type_text_html);
+    request.respond(response).map_err(|err| {
+        eprintln!("ERROR: could not server a request: {err}");
+    })?;
+    Ok(())
+}
 fn entry() -> Result<(), ()> {
     let mut args = env::args();
     let program = args.next().expect("path to program is provided");
@@ -201,6 +218,19 @@ fn entry() -> Result<(), ()> {
             })?;
 
             check_index(&index_path)?;
+        },
+        "serve" => {
+            let address = args.next().unwrap_or("127.0.0.1:6969".to_string()); 
+            let server = Server::http(&address).map_err(|err| {
+                eprintln!("ERROR: could not start HTTP server at {address}: {err}");
+            })?;
+
+            println!("INFO: listening at http://{address}");
+            for request in server.incoming_requests() {
+                server_request(request);
+            }
+
+            todo!("No implemented yet")
         },
         _ => {
             usage(&program);
