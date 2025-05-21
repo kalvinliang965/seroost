@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::env;
 use std::result::Result;
 use std::process::ExitCode;
+use std::str;
 
-use tiny_http::{Server, Request, Response, Header};
+use tiny_http::{Server, Request, Response, Header, StatusCode, Method};
 
 struct Lexer<'a> {
     content: &'a [char],
@@ -40,25 +41,25 @@ impl<'a> Lexer<'a> {
 
     }
 
-    fn next_token(&mut self) -> Option<&'a [char]> {
+    fn next_token(&mut self) -> Option<String> {
         self.trim_left();
         if self.content.len() == 0 {
             return None
         }
         
         if self.content[0].is_numeric() {
-            return Some(self.chop_while(|x| x.is_numeric()));
+            return Some(self.chop_while(|x| x.is_numeric()).iter().collect());
         }
 
         if self.content[0].is_alphabetic() {
-            return Some(self.chop_while(|x| x.is_alphanumeric()));
+            return Some(self.chop_while(|x| x.is_alphanumeric()).iter().map(|x| x.to_ascii_uppercase()).collect());
         }
-        return Some(self.chop(1));
+        return Some(self.chop(1).iter().collect());
     }
 }
 
 impl<'a> Iterator for Lexer<'a> {
-    type Item = &'a[char];
+    type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_token()
@@ -155,8 +156,7 @@ fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(
 
         let mut tf = TermFreq::new();
 
-        for token in Lexer::new(&content) {
-            let term = token.iter().map(|x| x.to_ascii_uppercase()).collect::<String>();
+        for term in Lexer::new(&content) {
             if let Some(freq) = tf.get_mut(&term) {
                 *freq += 1;
             } else {
@@ -172,25 +172,87 @@ fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(
 fn usage(program: &str) {
     eprintln!("Usage: {program} [SUBCOMMAND] [OPTIONS]");
     eprintln!("Subcommands:");
-    eprintln!("     index <folder>          index the <folder> and save the index to index.json file");
-    eprintln!("     search <index-file>     check how many documents are indexed in the file (searching is not implemented yet)");
-    eprintln!("     serve [address]          start local HTTP server with web interface");
+    eprintln!("     index <folder>                       index the <folder> and save the index to index.json file");
+    eprintln!("     search <index-file>                  check how many documents are indexed in the file (searching is not implemented yet)");
+    eprintln!("     serve <index-file> [address]         start local HTTP server with web interface");
 }
 
-fn server_request(request: Request) -> Result<(), ()> {
-    println!("INFO: recieved request! method: {:?}, url: {:?}", request.method(), request.url());
-    let content_type_text_html = Header::from_bytes("Content-Type", "text/html; charset=utf-8")
-                                    .expect("That we didn't put any garbage in the header");
-    let index_html_path = "index.html";
-    let index_html_file = File::open(index_html_path).map_err(|err| {
-        eprintln!("ERROR: could not serve file {index_html_path}: {err}");
+fn serve_static_file(request: Request, file_path: &str, content_type: &str) -> Result<(), ()> {
+    let content_type_headder = Header::from_bytes("Content-Type", content_type)
+        .expect("That we didn't put any garbage in the headers");
+    let file = File::open(file_path).map_err(|err| {
+        eprintln!("ERROR: could not serve static file {file_path}: {err}");
     })?;
-    let response = Response::from_file(index_html_file).with_header(content_type_text_html);
+    let response = Response::from_file(file).with_header(content_type_headder);
     request.respond(response).map_err(|err| {
         eprintln!("ERROR: could not server a request: {err}");
-    })?;
-    Ok(())
+    })
 }
+
+fn serve_404(request: Request) -> Result<(), ()> {
+    request.respond(Response::from_string("404").with_status_code(StatusCode(404))).map_err(|err| {
+        eprintln!("ERROR: could not serve a request: {err}");
+    })
+}
+
+// apply the term frequency formula
+fn tf(t: &str, d: &TermFreq) -> f32 {
+    let a = d.get(t).cloned().unwrap_or(0) as f32;
+    let b = d.iter().map(|(_, f)| *f).sum::<usize>() as f32;
+    if b == 0.0 {
+        return 0.0;
+    }
+    a / b
+}
+
+fn idf(t: &str, d: &TermFreqIndex) -> f32 {
+    let N = d.len() as f32;
+    let M = d.values().filter(|tf| tf.contains_key(t)).count() as f32;
+
+    return (N / M.max(1.0)).log10();
+
+}
+
+fn server_request(tf_index: &TermFreqIndex, mut request: Request) -> Result<(), ()> {
+    println!("INFO: recieved request! method: {:?}, url: {:?}", request.method(), request.url());
+
+    match (request.method(), request.url()) {
+        (Method::Post, "/api/search") => {
+            let mut buf = Vec::new();
+            request.as_reader().read_to_end(&mut buf);
+            let body = str::from_utf8(&buf).map_err(|err| {
+                eprintln!("ERROR: could not interpret body as utf8 string: {err}");
+            })?.chars().collect::<Vec<_>>();
+            
+            let mut result = Vec::<(&Path, f32)>::new();
+            for (path, tf_table) in tf_index {
+                let mut rank = 0 as f32;
+                for token in Lexer::new(&body) {
+                    rank += tf(&token, &tf_table) * idf(&token, &tf_index);
+                }
+                result.push((path, rank));
+            }
+            result.sort_by(|(_, rank1), (_, rank2)| rank2.partial_cmp(rank1).unwrap());
+            
+            for (path, rank) in result.iter().take(10) {
+                println!("{path} => {rank}", path = path.display());
+            }
+            request.respond(Response::from_string("ok")).map_err(|err| {
+                eprintln!("ERROR: {err}");
+            })
+        },
+        (Method::Get, "/index.js") => {
+            serve_static_file(request, "index.js", "text/javascript; charset=utf-8")
+        },
+        (Method::Get, "/") | (Method::Get, "/index.html") => {
+            serve_static_file(request, "index.html", "text/html; charset=utf-8")
+        },
+        _ => {
+            serve_404(request)
+        }
+    }
+}
+
 fn entry() -> Result<(), ()> {
     let mut args = env::args();
     let program = args.next().expect("path to program is provided");
@@ -220,6 +282,19 @@ fn entry() -> Result<(), ()> {
             check_index(&index_path)?;
         },
         "serve" => {
+            let index_path = args.next().ok_or_else(|| {
+                usage(&program);
+                eprintln!("ERROR: no path to index is provided for {subcommand} subcommand");
+            })?;
+
+            let index_file = File::open(&index_path).map_err(|err| {
+                eprintln!("ERROR: could not open index file {index_path}:{err}");
+            })?;
+
+            let tf_index: TermFreqIndex = serde_json::from_reader(index_file).map_err(|err| {
+                eprintln!("ERROR: could not parse index file {index_path}: {err}");
+            })?;
+
             let address = args.next().unwrap_or("127.0.0.1:6969".to_string()); 
             let server = Server::http(&address).map_err(|err| {
                 eprintln!("ERROR: could not start HTTP server at {address}: {err}");
@@ -227,7 +302,7 @@ fn entry() -> Result<(), ()> {
 
             println!("INFO: listening at http://{address}");
             for request in server.incoming_requests() {
-                server_request(request);
+                server_request(&tf_index, request);
             }
 
             todo!("No implemented yet")
